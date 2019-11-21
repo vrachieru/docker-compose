@@ -1,0 +1,302 @@
+#
+# A three node ES cluster load balanced via nginx proxy with SSL between inter-node communication and REST.
+#
+# Production ES instances require the host to have m.max_map_count set to 262144.
+# sudo sysctl -w vm.max_map_count=262144
+# 
+# Configuration is done via host environment variables as follows:
+#
+# Environment variable             Default value              Description
+# --------------------             -------------              -----------
+# ELASTICSEARCH_PASSWORD           changeme                   Basic auth credentials
+# ELASTICSEARCH_CORS_ALLOW_ORIGIN  *                          Origins allowed to access the cluster
+# ELASTICSEARCH_CA_VALIDITY        3650                       Validity of certificate authority in days
+# ELASTICSEARCH_CA_PASSWORD        changeme                   Certiicate authority password
+# ELASTICSEARCH_CERT_VALIDITY      365                        Validity of client certificate in days
+# ELASTICSEARCH_CERT_PASSWORD      changeme                   Password of client certificate
+# ELASTICSEARCH_CERT_HOSTS         elasticsearch-*,localhost  Hosts allowed to use client certificate
+#
+# After configuration, you need to generate the SSL certificates via the elasticsearch-certificate-init service (docker-compose up elasticsearch-certificate-init)
+# This will create a bounch of certificates in your current working directory.
+#
+# Next, start the ES cluster via the elasticsearch-proxy service (docker-compose up elasticsearch-proxy).
+# Note that the ES nodes are dependant on said service and will start automatically.
+#
+# Wait for the cluster to be up and ready by checking service health via: watch -n 30 docker-compose ps
+# Once all services are ready you can make use of the cluster.
+# A couple of examples:
+#
+# Check xpack security status
+# curl --cacert elastic-ca.pem -u elastic:changeme https://localhost:9200/_xpack?pretty
+#
+# Check nodes status
+# curl --cacert elastic-ca.pem -u elastic:changeme https://localhost:9200/_nodes/stats/http?pretty
+#
+# Node information (you can observe load balancing via node name)
+# curl --cacert elastic-ca.pem -u elastic:changeme https://localhost:9200
+#
+# Good to know:
+# - https://opendistro.github.io/for-elasticsearch-docs/docs/troubleshoot/#java-error-during-startup
+
+version: '3.6'
+
+x-network: &network
+  networks:
+    - elastic
+
+x-elasticsearch-base: &elasticsearch-base
+  image: docker.elastic.co/elasticsearch/elasticsearch:7.4.2
+  secrets:
+    - source: elastic-ca.pem
+      target: /usr/share/elasticsearch/config/elastic-ca.pem
+    - source: elastic-ca.p12
+      target: /usr/share/elasticsearch/config/elastic-ca.p12
+    - source: elastic-certificates.p12
+      target: /usr/share/elasticsearch/config/elastic-certificates.p12
+  ulimits:
+    memlock:
+      soft: -1 
+      hard: -1
+  healthcheck:
+    test: |
+      curl \
+        --silent \
+        --cacert /usr/share/elasticsearch/config/elastic-ca.pem \
+        --user elastic:$$ELASTIC_PASSWORD \
+        https://localhost:9200
+    interval: 30s
+    timeout: 10s
+    retries: 5
+  <<: *network
+
+
+x-elasticsearch-environment: &elasticsearch-environment
+  #-# System
+  
+  ES_JAVA_OPTS: '-Xms512m -Xmx512m'
+  bootstrap.memory_lock: 'true'
+
+  #-# Cluster
+  #-# https://www.elastic.co/guide/en/elasticsearch/reference/current/important-settings.html
+
+  cluster.name: elasticsearch-cluster
+  cluster.initial_master_nodes: elasticsearch-01,elasticsearch-02,elasticsearch-03
+  
+  #-# Security
+  #-# https://www.elastic.co/guide/en/elasticsearch/reference/current/security-settings.html
+
+  # Credentials
+  ELASTIC_PASSWORD: ${ELASTICSEARCH_PASSWORD:-changeme}
+
+  # CORS
+  http.cors.enabled: 'true'
+  http.cors.allow-origin: ${ELASTICSEARCH_CORS_ALLOW_ORIGIN:-*}
+
+  # Encryption
+  xpack.security.enabled: 'true'
+
+  # HTTP communication encryption (https)
+  xpack.security.http.ssl.enabled: 'true'
+  xpack.security.http.ssl.verification_mode: certificate # does not verify hostname, only ca signing
+  xpack.security.http.ssl.keystore.path: elastic-certificates.p12
+  xpack.security.http.ssl.keystore.type: PKCS12
+  xpack.security.http.ssl.keystore.password: ${ELASTICSEARCH_CERT_PASSWORD:-changeme}
+  xpack.security.http.ssl.truststore.path: elastic-ca.p12
+  xpack.security.http.ssl.truststore.type: PKCS12
+  xpack.security.http.ssl.truststore.password: ${ELASTICSEARCH_CERT_PASSWORD:-changeme}
+
+  # Inter node communication encryption
+  xpack.security.transport.ssl.enabled: 'true'
+  xpack.security.transport.ssl.verification_mode: certificate # does not verify hostname, only ca signing
+  xpack.security.transport.ssl.keystore.path: elastic-certificates.p12
+  xpack.security.transport.ssl.keystore.type: PKCS12
+  xpack.security.transport.ssl.keystore.password: ${ELASTICSEARCH_CERT_PASSWORD:-changeme}
+  xpack.security.transport.ssl.truststore.path: elastic-ca.p12
+  xpack.security.transport.ssl.truststore.type: PKCS12
+  xpack.security.transport.ssl.truststore.password: ${ELASTICSEARCH_CERT_PASSWORD:-changeme}
+
+services:
+  elasticsearch-certificate-init:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.4.2
+    container_name: elasticsearch-certificate-init
+    environment:
+      ca_validity: ${ELASTICSEARCH_CA_VALIDITY:-3650}
+      ca_password: ${ELASTICSEARCH_CA_PASSWORD:-changeme}
+      cert_validity: ${ELASTICSEARCH_CERT_VALIDITY:-365}
+      cert_password: ${ELASTICSEARCH_CERT_PASSWORD:-changeme}
+
+      # By default a single certificate valid for any host is created
+      # A certificate for valid for multiple specific hosts can be created by
+      # a. adding said hostnames to the subject alternate name (SAN)
+      # b. creating individual client certificates
+      cert_hosts: ${ELASTICSEARCH_CERT_HOSTS:-elasticsearch-*,localhost}
+    working_dir: /usr/share/elasticsearch/config/certificates
+    volumes: 
+      - ./:/usr/share/elasticsearch/config/certificates
+    tty: true
+    command: 
+      - /bin/sh 
+      - -c
+      - |
+          # https://www.elastic.co/guide/en/elasticsearch/reference/current/certutil.html
+
+          # Create CA
+          if [[ ! -f elastic-ca.p12 ]]; then
+            elasticsearch-certutil ca \
+              --days $${ca_validity} \
+              --pass "$${ca_password}" \
+              --out "$$(pwd)/elastic-ca.p12"
+          fi;
+
+          # Create user certificate
+          if [[ ! -f elastic-certificates.p12 ]]; then
+            elasticsearch-certutil cert \
+              --ca "$$(pwd)/elastic-ca.p12" \
+              --ca-pass "$${ca_password}" \
+              --dns "$${cert_hosts}" \
+              --days $${cert_validity} \
+              --pass "$${cert_password}" \
+              --out "$$(pwd)/elastic-certificates.p12"
+          fi
+
+          # Break down into certificates and keys
+          # Needed for nginx, curl and adding the CA to trust store
+          if [[ ! -f elastic-certificates.pem ]] || [[ ! -f elastic-certificates.key ]]; then
+            yum install -y openssl
+            
+            for certificate in *.p12; do 
+              openssl pkcs12 \
+                -nokeys \
+                -in "$$certificate" \
+                -passin "pass:$${cert_password}" \
+                -out "$${certificate%.p12}.pem"
+
+              openssl pkcs12 \
+                -nocerts \
+                -nodes \
+                -in "$$certificate" \
+                -passin "pass:$${cert_password}" \
+                -out "$${certificate%.p12}.key"
+            done
+          fi
+
+          # Change owner to host user
+          chown ${UID:-1000} \
+            *.p12 \
+            *.pem \
+            *.key
+
+  elasticsearch-proxy:
+    image: nginx:1.17-alpine
+    container_name: elasticsearch-proxy
+    ports:
+      - 9200:9200
+    secrets:
+      - source: elastic-certificates.pem
+        target: /certificates/elastic-certificates.pem
+      - source: elastic-certificates.key
+        target: /certificates/elastic-certificates.key
+    depends_on:
+      - elasticsearch-01
+      - elasticsearch-02
+      - elasticsearch-03
+    command: 
+      - /bin/sh 
+      - -c
+      - |
+          tee /etc/nginx/nginx.conf > /dev/null << EOF
+            events {
+                worker_connections 1024;
+            }
+
+            http {
+              client_max_body_size 10M;
+              
+              upstream elasticsearch {
+                server elasticsearch-01:9200 max_fails=3 fail_timeout=30s;
+                server elasticsearch-02:9200 max_fails=3 fail_timeout=30s;
+                server elasticsearch-03:9200 max_fails=3 fail_timeout=30s;
+                keepalive 15;
+              }
+
+              server {
+                listen 9200 ssl;
+
+                ssl_certificate /certificates/elastic-certificates.pem;
+                ssl_certificate_key /certificates/elastic-certificates.key;
+
+                location / {
+                  proxy_pass https://elasticsearch;
+                  proxy_http_version 1.1;
+                  proxy_ssl_server_name on;
+                  proxy_ssl_session_reuse on;
+                }
+              }
+            }
+          EOF
+
+          nginx -g 'daemon off;'
+    <<: *network
+
+  elasticsearch-01:
+    <<: *elasticsearch-base
+    container_name: elasticsearch-01
+    environment:
+      <<: *elasticsearch-environment
+      node.name: elasticsearch-01
+      discovery.seed_hosts: elasticsearch-02,elasticsearch-03
+    volumes:
+      - elasticsearch-data-01:/usr/share/elasticsearch/data
+    ports:
+      - 9201:9200
+
+  elasticsearch-02:
+    <<: *elasticsearch-base
+    container_name: elasticsearch-02
+    environment:
+      <<: *elasticsearch-environment
+      node.name: elasticsearch-02
+      discovery.seed_hosts: elasticsearch-01,elasticsearch-03
+    volumes:
+      - elasticsearch-data-02:/usr/share/elasticsearch/data
+    ports:
+      - 9202:9200
+
+  elasticsearch-03:
+    <<: *elasticsearch-base
+    container_name: elasticsearch-03
+    environment:
+      <<: *elasticsearch-environment
+      node.name: elasticsearch-03
+      discovery.seed_hosts: elasticsearch-01,elasticsearch-02
+    volumes:
+      - elasticsearch-data-03:/usr/share/elasticsearch/data
+    ports:
+      - 9203:9200
+
+
+volumes:
+  elasticsearch-data-01:
+    driver: local
+  elasticsearch-data-02:
+    driver: local
+  elasticsearch-data-03:
+    driver: local
+
+secrets:
+  elastic-ca.p12:
+    file: ./elastic-ca.p12
+  elastic-ca.pem:
+    file: ./elastic-ca.pem
+  elastic-ca.key:
+    file: ./elastic-ca.key
+  elastic-certificates.p12:
+    file: ./elastic-certificates.p12
+  elastic-certificates.pem:
+    file: ./elastic-certificates.pem
+  elastic-certificates.key:
+    file: ./elastic-certificates.key
+
+networks:
+  elastic:
+    driver: bridge
