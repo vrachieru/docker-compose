@@ -1,30 +1,34 @@
-version: '3'
+version: '3.6'
+
+x-redis-base: &redis-base
+  image: redis:5.0-alpine
+  networks:
+    - redis
+
 services:
   master:
-    image: redis:5.0-alpine
-    networks:
-      - services
-
+    <<: *redis-base
+  
   slave:
-    image: redis:5.0-alpine
+    <<: *redis-base
     command: redis-server --slaveof master 6379
-    networks:
-      - services
 
   sentinel:
-    image: redis:5.0-alpine
-    command: >
-      sh -c "
-        echo 'port 26379' > sentinel.conf &&
-        echo 'dir /tmp' >> sentinel.conf &&
-        echo 'sentinel monitor master master 6379 2' >> sentinel.conf &&
-        echo 'sentinel down-after-milliseconds master 5000' >> sentinel.conf &&
-        echo 'sentinel parallel-syncs master 1' >> sentinel.conf &&
-        echo 'sentinel failover-timeout master 5000' >> sentinel.conf &&
-      cat sentinel.conf &&
-      redis-server sentinel.conf --sentinel"
-    networks:
-      - services
+    <<: *redis-base
+    command:
+      - /bin/sh 
+      - -c
+      - |
+          tee sentinel.conf > /dev/null << EOF
+            port 26379
+            dir /tmp
+            sentinel monitor master master 6379 2
+            sentinel down-after-milliseconds master 5000
+            sentinel parallel-syncs master 1
+            sentinel failover-timeout master 5000
+          EOF
+          
+          redis-server sentinel.conf --sentinel
 
 networks:
-  services:
+  redis:
