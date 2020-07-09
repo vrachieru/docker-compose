@@ -1,0 +1,75 @@
+version: '3.6'
+
+x-base-service: &base-service
+  networks:
+    - services
+
+services:
+  zookeeper:
+    <<: *base-service
+    image: confluentinc/cp-zookeeper:5.5.0
+    container_name: zookeeper
+    ports:
+      - 2181:2181
+    environment:
+      - ZOOKEEPER_SERVER_ID=1
+      - ZOOKEEPER_CLIENT_PORT=2181
+      - ZOOKEEPER_TICK_TIME=2000
+      - KAFKA_LOG4J_ROOT_LOGLEVEL=INFO
+      - KAFKA_TOOLS_LOG4J_LOGLEVEL=INFO
+
+  kafka:
+    <<: *base-service
+    image: confluentinc/cp-kafka:5.5.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - 9092:9092
+      - 9093:9093
+    environment:
+      - KAFKA_BROKER_ID=1
+      - KAFKA_ZOOKEEPER_CONNECT=zookeeper:2181
+      - KAFKA_INTER_BROKER_LISTENER_NAME=DOCKER
+      - KAFKA_ADVERTISED_LISTENERS=HOST://localhost:9092,DOCKER://kafka:9093
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=HOST:PLAINTEXT,DOCKER:PLAINTEXT
+      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+      - KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
+      - KAFKA_AUTO_CREATE_TOPICS_ENABLE=false
+      - KAFKA_DELETE_TOPIC_ENABLE=true
+      - KAFKA_LOG4J_ROOT_LOGLEVEL=INFO
+      - KAFKA_TOOLS_LOG4J_LOGLEVEL=INFO
+      - KAFKA_LOG4J_LOGGERS=kafka.controller=INFO,state.change.logger=INFO,kafka.producer.async.DefaultEventHandler=INFO
+
+  # This container is a workaround to pre-create topics
+  # https://github.com/confluentinc/examples/blob/5.1.1-post/microservices-orders/docker-compose.yml#L182-L215
+  kafka-setup:
+    <<: *base-service
+    image: confluentinc/cp-kafka:5.5.0
+    container_name: kafka-setup
+    depends_on:
+      - kafka
+    command: "bash -c 'echo Waiting for Kafka to be ready... && \
+                       cub kafka-ready -b kafka:9093 1 300 && \
+                       kafka-topics --create --if-not-exists --zookeeper zookeeper:2181 --partitions 1 --replication-factor 1 --topic mytopic'"
+    environment:
+      # The following settings are listed here only to satisfy the image's requirements.
+      # We override the image's `command` anyways, hence this container will not start a broker.
+      KAFKA_BROKER_ID: ignored
+      KAFKA_ZOOKEEPER_CONNECT: ignored
+
+  kafka-control-center:
+    <<: *base-service
+    image: confluentinc/cp-enterprise-control-center:5.5.0
+    container_name: kafka-control-center
+    depends_on:
+      - kafka
+    ports:
+      - 9021:9021
+    environment:
+      - CONTROL_CENTER_ZOOKEEPER_CONNECT=zookeeper:2181/defaultconfig
+      - CONTROL_CENTER_BOOTSTRAP_SERVERS=kafka:9093
+      - CONTROL_CENTER_REPLICATION_FACTOR=1
+
+networks:
+  services:
